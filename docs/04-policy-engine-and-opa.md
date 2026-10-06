@@ -1,0 +1,94 @@
+# 04 Policy Engine and OPA
+
+## Table of Contents
+1. [TL;DR](#tldr)
+2. [What are OPA and Rego?](#what-are-opa-and-rego)
+3. [Deployment & Invocation](#deployment--invocation)
+4. [Input Document Shapes](#input-document-shapes)
+5. [Repo Layout](#repo-layout)
+6. [Policy Inventory](#policy-inventory)
+7. [Policy Walkthrough (5-8 Rules)](#policy-walkthrough-5-8-rules)
+8. [Results to Findings Pipeline](#results-to-findings-pipeline)
+9. [Testing and CI](#testing-and-ci)
+10. [How to Add a New Policy](#how-to-add-a-new-policy)
+
+## TL;DR
+- Open Policy Agent (OPA) evaluates cloud resource configurations using policies written in **Rego**.
+- OPA runs as a separate HTTP service and is queried via REST API (`/v1/data/...`) by the Celery worker.
+- Evaluated results are transformed into PostgreSQL `Finding` records, updating `last_seen` to track active issues.
+- **Unit testing for Rego was not found in the codebase.**
+
+## What are OPA and Rego?
+**Open Policy Agent (OPA)** is an open-source, general-purpose policy engine that decouples policy decision-making from policy enforcement. **Rego** is the declarative query language used by OPA to write policies. In CloudSecure, Rego policies define what a "compliant" AWS resource looks like. If a resource fails a check, Rego returns a `deny` message explaining the violation.
+
+## Deployment & Invocation
+OPA is not embedded in the Python runtime. Instead, it is deployed as an external service (likely a separate Docker container) accessible via HTTP (`opa_url` in config).
+- **Loading Policies:** When rules change, `load_policy` (`opa_client.py:L19`) dynamically pushes `.rego` file contents to `PUT /v1/policies/{policy_id}`.
+- **Evaluation:** During a scan, `evaluate` (`opa_client.py:L33`) sends the JSON configuration of a single resource to `POST /v1/data/{package_path}` and extracts the resulting `deny` list.
+
+## Input Document Shapes
+The raw Boto3 dictionary fetched from AWS is too complex and variable for clean Rego policies. Before sending to OPA, `input_builder.py` normalizes the config into a predictable `input.asset` object. 
+
+**Example Shape for S3 (`asset_type: "s3_bucket"`):**
+```json
+{
+  "asset_type": "s3_bucket",
+  "bucket_name": "my-bucket",
+  "region": "us-east-1",
+  "account_id": "123456789012",
+  "tags": {"environment": "production"},
+  "block_public_acls": true,
+  "ignore_public_acls": true,
+  "block_public_policy": false,
+  "restrict_public_buckets": false
+}
+```
+
+## Repo Layout
+All Rego policies are located in `backend-fastapi/worker/jobs/inventory/rules/`:
+- `cis_aws_*.rego`: Standard CIS benchmark rules.
+- `india_aws_*.rego`: India-specific compliance rules (DPDP 2023, CERT-In, RBI).
+- `consolidated_s3.rego` / `unified_contextual_rules.rego`: Aggregated and contextual logic.
+
+## Policy Inventory
+| Rego File | Description | Target Asset Types |
+|-----------|-------------|--------------------|
+| `cis_aws_s3.rego` | CIS benchmarks for S3 buckets | `s3_bucket` |
+| `cis_aws_ec2.rego` | CIS benchmarks for EC2 and SGs | `ec2_instance`, `security_group` |
+| `cis_aws_iam.rego` | CIS benchmarks for IAM users/roles| `iam_user`, `iam_role` |
+| `cis_aws_rds.rego` | CIS benchmarks for RDS instances | `rds_instance` |
+| `cis_aws_kms.rego` | CIS benchmarks for KMS keys | `kms_key` |
+| `cis_aws_cloudtrail.rego` | CIS benchmarks for CloudTrail | `cloudtrail_trail` |
+| `india_aws_s3.rego` | DPDP/CERT-In for S3 | `s3_bucket` |
+| `india_aws_ec2.rego` | DPDP/CERT-In for EC2/SG | `ec2_instance`, `security_group` |
+| `india_aws_iam.rego` | DPDP/CERT-In for IAM | `iam_user`, `iam_role` |
+| `india_aws_rds.rego` | DPDP/CERT-In for RDS | `rds_instance` |
+| `india_aws_kms.rego` | DPDP/CERT-In for KMS | `kms_key` |
+| `india_aws_cloudtrail.rego`| DPDP/CERT-In for CloudTrail | `cloudtrail_trail` |
+
+## Policy Walkthrough (5-8 Rules)
+
+1. **`CIS-2.1.4` (S3 Block Public Access):** Verifies `block_public_acls`, `ignore_public_acls`, `block_public_policy`, and `restrict_public_buckets` are all `true`. Essential to prevent accidental public data exposure.
+2. **`DPDP-S3-PUBLIC` (India DPDP S3):** A region-specific mapping of CIS-2.1.4, mapping the same misconfiguration to a violation of Section 8 of the DPDP Act 2023 (protecting personal data).
+3. **`CIS-4.1.1` (SG Allows All Inbound):** Checks if a `security_group` allows ingress from `0.0.0.0/0` on all ports. Raises a `CRITICAL` severity if the SG is tagged `environment: production`, otherwise `HIGH`.
+4. **`CIS-4.1.2` (SG SSH Open):** Checks if SSH (port 22) is open to the internet (`0.0.0.0/0`).
+5. **`CIS-1.10` (IAM Console without MFA):** Checks if an `iam_user` has `has_console_password == true` but `mfa_enabled == false`. A primary defense against credential stuffing.
+6. **`CIS-1.15` (IAM Inline Policies):** Checks if `count(inline_policy_names) > 0`. Mandates that permissions be attached via IAM Groups rather than directly to users inline.
+
+## Results to Findings Pipeline
+
+1. **OPA Response:** OPA returns a list of dictionaries generated by the `deny` blocks.
+2. **Deduplication:** `evaluator.py:evaluate_resource` queries PostgreSQL (`repo.finding_exists`) for an existing finding with the same `arn` and `rule_id`.
+3. **Validation Probes:** Custom Python logic (`_apply_validation_probe`) may execute secondary checks (e.g., verifying if an S3 bucket is *actually* accessible) to reduce false positives.
+4. **Upsert:** 
+   - If a finding exists, its `last_seen` timestamp is updated, and its status is adjusted based on the probe.
+   - If it does not exist, a new `Finding` record is created.
+
+## Testing and CI
+**Not found in codebase:** Searched for `.rego` unit tests, `_test.rego` files, and CI pipelines (GitHub Actions, GitLab CI) running `opa test`. Currently, policies lack automated unit tests.
+
+## How to Add a New Policy
+1. **Write the Policy:** Create a new `.rego` file in `worker/jobs/inventory/rules/`.
+2. **Define the Deny Block:** Ensure the rule checks `input.asset.asset_type` and outputs a dictionary containing `rule_id`, `issue`, `severity`, `compliance`, and `remediation`.
+3. **Register Package:** Add the package path (e.g. `cloudsecure.rules.new_rule`) to the `PACKAGE_MAP` in `worker/jobs/rule_engine/evaluator.py` under the corresponding resource type.
+4. **Mapping:** Ensure `input_builder.py` provides the necessary keys in the `input.asset` object for your new rule to evaluate.
